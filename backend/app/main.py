@@ -14,6 +14,7 @@ from .models import (
     Terminology, Translation, TranslationMemory, TranslationString,
 )
 from .po_import import import_po_file
+from .ts_import import import_ts_file
 from .schemas import (
     ProjectOut, QueueOut, QualityCheckOut, TMMatch,
     ReviewItem, ReviewDecision, ReviewStats,
@@ -250,6 +251,7 @@ async def untranslated_strings(limit: int = Query(default=50, le=500), db: Async
     ]
 
 
+@app.get("/api/strings/{string_id}/detail")
 @app.get("/api/strings/{string_id}")
 async def get_string(string_id: int, db: AsyncSession = Depends(get_db)):
     """String details including all files using it, translation, and reviews."""
@@ -312,6 +314,36 @@ async def get_string(string_id: int, db: AsyncSession = Depends(get_db)):
         char_count=s.char_count, word_count=s.word_count,
         files=files, translation=translation_out,
     )
+
+
+@app.post("/api/strings/{string_id}/approve")
+async def approve_string(string_id: int, db: AsyncSession = Depends(get_db)):
+    t = (await db.execute(
+        select(Translation).where(Translation.string_id == string_id, Translation.is_current == True)
+    )).scalar()
+    if not t:
+        raise HTTPException(404, "Translation not found")
+    t.quality_level = 9
+    t.is_approved = True
+    review = Review(translation_id=t.id, reviewer="human", reviewer_type="human", action="approve", old_msgstr=t.msgstr)
+    db.add(review)
+    await db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/strings/{string_id}/reject")
+async def reject_string(string_id: int, db: AsyncSession = Depends(get_db)):
+    t = (await db.execute(
+        select(Translation).where(Translation.string_id == string_id, Translation.is_current == True)
+    )).scalar()
+    if not t:
+        raise HTTPException(404, "Translation not found")
+    t.quality_level = 1
+    t.is_approved = False
+    review = Review(translation_id=t.id, reviewer="human", reviewer_type="human", action="reject", old_msgstr=t.msgstr)
+    db.add(review)
+    await db.commit()
+    return {"ok": True}
 
 
 @app.put("/api/strings/{string_id}/translate")
@@ -594,25 +626,89 @@ async def export_po(file_id: int, db: AsyncSession = Depends(get_db)):
 # ---------- Projects ----------
 
 @app.get("/api/projects")
-async def list_projects(db: AsyncSession = Depends(get_db)):
-    q = select(Project).order_by(Project.name)
-    projects = (await db.execute(q)).scalars().all()
-    results = []
-    for p in projects:
-        # Get file stats
-        stats = await db.execute(
-            select(
-                func.coalesce(func.sum(File.total_strings), 0),
-                func.coalesce(func.sum(File.translated_strings), 0),
-            ).where(File.project_id == p.id)
+async def list_projects(
+    q: str = Query(None, alias="search"),
+    has_strings: bool = Query(False),
+    offset: int = 0,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    """List projects with aggregated file/string stats in a single query."""
+    from sqlalchemy import case, literal_column
+    base = (
+        select(
+            Project.id, Project.name, Project.slug, Project.platform, Project.url, Project.description,
+            func.count(File.id).label('file_count'),
+            func.coalesce(func.sum(File.total_strings), 0).label('total_strings'),
+            func.coalesce(func.sum(File.translated_strings), 0).label('translated_strings'),
         )
-        row = stats.one()
-        results.append(ProjectOut(
-            id=p.id, name=p.name, slug=p.slug,
-            platform=p.platform, url=p.url, description=p.description,
-            total_strings=row[0], translated_strings=row[1],
-        ))
-    return results
+        .outerjoin(File, File.project_id == Project.id)
+        .group_by(Project.id)
+    )
+    if q:
+        base = base.where(Project.name.ilike(f"%{q}%"))
+    if has_strings:
+        base = base.having(func.coalesce(func.sum(File.total_strings), 0) > 0)
+    # Count query
+    from sqlalchemy import text
+    count_sub = base.subquery()
+    total = (await db.execute(select(func.count()).select_from(count_sub))).scalar() or 0
+    # Data query
+    rows = (await db.execute(
+        base.order_by(func.coalesce(func.sum(File.total_strings), 0).desc(), Project.name)
+        .offset(offset).limit(limit)
+    )).all()
+    return {
+        "total": total,
+        "projects": [
+            {
+                "id": r.id, "name": r.name, "slug": r.slug,
+                "platform": r.platform, "url": r.url, "description": r.description,
+                "file_count": r.file_count,
+                "total_strings": r.total_strings,
+                "translated_strings": r.translated_strings,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project(
+    project_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get single project with all its files."""
+    project = (await db.execute(select(Project).where(Project.id == project_id))).scalar()
+    if not project:
+        raise HTTPException(404, "Project not found")
+    files = (await db.execute(
+        select(File)
+        .where(File.project_id == project_id)
+        .where(File.total_strings > 0)
+        .order_by(File.total_strings.desc())
+    )).scalars().all()
+    return {
+        "id": project.id,
+        "name": project.name,
+        "slug": project.slug,
+        "platform": project.platform,
+        "url": project.url,
+        "description": project.description,
+        "files": [
+            {
+                "id": f.id,
+                "path": f.path,
+                "format": f.format,
+                "total_strings": f.total_strings or 0,
+                "translated_strings": f.translated_strings or 0,
+                "last_export_at": f.last_export_at.isoformat() if f.last_export_at else None,
+            }
+            for f in files
+        ],
+        "total_strings": sum(f.total_strings or 0 for f in files),
+        "total_files": len(files),
+    }
 
 
 # ---------- Queue ----------
@@ -640,6 +736,49 @@ async def list_queue(db: AsyncSession = Depends(get_db)):
             priority=rq.priority,
         )
         for rq in items
+    ]
+
+
+@app.get("/api/queues/{queue_id}")
+async def get_queue_item(queue_id: int, db: AsyncSession = Depends(get_db)):
+    rq = await db.get(ReviewQueue, queue_id, options=[selectinload(ReviewQueue.file).selectinload(File.project)])
+    if not rq:
+        raise HTTPException(404, "Queue item not found")
+    return QueueOut(
+        id=rq.id, file_id=rq.file_id,
+        file_path=rq.file.path if rq.file else None,
+        project_name=rq.file.project.name if rq.file and rq.file.project else None,
+        status=rq.status, total_strings=rq.total_strings,
+        reviewed_count=rq.reviewed_count, approved_count=rq.approved_count,
+        rejected_count=rq.rejected_count, score=rq.score,
+        queue_type=rq.queue_type, priority=rq.priority,
+    )
+
+
+@app.get("/api/queues/{queue_id}/strings")
+async def get_queue_strings(queue_id: int, offset: int = 0, limit: int = 50, db: AsyncSession = Depends(get_db)):
+    rq = await db.get(ReviewQueue, queue_id)
+    if not rq:
+        raise HTTPException(404, "Queue item not found")
+    q = text("""
+        SELECT s.id as string_id, s.msgid, t.id as translation_id, t.msgstr, t.quality_level,
+               fs.position, fs.context, fs.comment
+        FROM file_strings fs
+        JOIN strings s ON s.id = fs.string_id
+        JOIN translations t ON t.id = fs.translation_id
+        WHERE fs.file_id = :file_id
+        ORDER BY t.quality_level ASC, fs.position ASC
+        OFFSET :offset LIMIT :limit
+    """)
+    rows = (await db.execute(q, {"file_id": rq.file_id, "offset": offset, "limit": limit})).mappings().all()
+    return [
+        {
+            "string_id": r["string_id"], "msgid": r["msgid"],
+            "translation_id": r["translation_id"], "msgstr": r["msgstr"],
+            "quality_level": r["quality_level"], "position": r["position"],
+            "context": r["context"], "comment": r["comment"],
+        }
+        for r in rows
     ]
 
 
@@ -827,6 +966,26 @@ async def review_stats(queue_id: int, db: AsyncSession = Depends(get_db)):
 
 # ---------- Import PO ----------
 
+@app.post("/api/import")
+async def import_file(file: UploadFile, project_name: str = Query(default=None), db: AsyncSession = Depends(get_db)):
+    """Import PO or TS translation files."""
+    if not file.filename:
+        raise HTTPException(400, "Filename is required")
+    
+    content = await file.read()
+    filename = file.filename
+    
+    # Detect file type
+    if filename.endswith('.ts') or content[:100].find(b'<!DOCTYPE TS>') >= 0:
+        result = await import_ts_file(db, content, filename, project_name)
+        return result
+    elif filename.endswith('.po'):
+        result = await import_po_file(db, filename, content, project_name)
+        return result
+    else:
+        raise HTTPException(400, "File must be .po or .ts")
+
+
 @app.post("/api/import/po")
 async def import_po(file: UploadFile, project_name: str = Query(default=None), db: AsyncSession = Depends(get_db)):
     if not file.filename or not file.filename.endswith(".po"):
@@ -905,7 +1064,7 @@ async def run_quality_check(file_id: int, db: AsyncSession = Depends(get_db)):
     
     try:
         # Run review-po-v3 --quick on the temporary file
-        review_po_path = os.environ.get("REVIEW_PO_PATH", os.path.expanduser("~/tools/review-po-v3/review-po-v3.py"))
+        review_po_path = os.path.expanduser("~/.openclaw/workspace-main/tools/review-po-v3/review-po-v3.py")
         
         if not os.path.exists(review_po_path):
             raise HTTPException(500, "review-po-v3 script not found")
@@ -1029,22 +1188,41 @@ async def run_quality_check(file_id: int, db: AsyncSession = Depends(get_db)):
 # ---------- Manual Review ----------
 
 @app.get("/api/review/batch")
-async def review_batch(limit: int = Query(default=50, le=500), db: AsyncSession = Depends(get_db)):
-    """Get next batch of strings for human review."""
-    q = (
+async def review_batch(
+    offset: int = 0,
+    limit: int = Query(default=50, le=500),
+    min_quality: int = 0,
+    max_quality: int = 7,
+    file_id: int = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get batch of strings for human review with pagination."""
+    base = (
         select(TranslationString.id.label("string_id"), TranslationString.msgid,
                Translation.id.label("translation_id"), Translation.msgstr,
                Translation.quality_level, Translation.source, Translation.updated_at)
         .join(Translation, Translation.string_id == TranslationString.id)
-        .where(Translation.is_current == True, Translation.quality_level < 8,
-               Translation.checked_out_by.is_(None))
-        .order_by(Translation.quality_level.asc(), TranslationString.id)
-        .limit(limit)
+        .where(Translation.is_current == True,
+               Translation.quality_level >= min_quality,
+               Translation.quality_level <= max_quality)
     )
+    if file_id:
+        base = base.join(FileString, FileString.string_id == TranslationString.id).where(FileString.file_id == file_id)
+    
+    # Count total
+    count_q = select(func.count()).select_from(base.subquery())
+    total = (await db.execute(count_q)).scalar() or 0
+    
+    q = base.order_by(Translation.quality_level.asc(), TranslationString.id).offset(offset).limit(limit)
     rows = (await db.execute(q)).all()
-    return [{"string_id": r.string_id, "msgid": r.msgid, "translation_id": r.translation_id,
-             "msgstr": r.msgstr, "quality_level": r.quality_level, "source": r.source,
-             "updated_at": r.updated_at.isoformat() if r.updated_at else None} for r in rows]
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "strings": [{"string_id": r.string_id, "msgid": r.msgid, "translation_id": r.translation_id,
+                 "msgstr": r.msgstr, "quality_level": r.quality_level, "source": r.source,
+                 "updated_at": r.updated_at.isoformat() if r.updated_at else None} for r in rows],
+    }
 
 
 @app.post("/api/review/submit")
@@ -1106,6 +1284,480 @@ async def run_quality_batch(file_ids: List[int], db: AsyncSession = Depends(get_
 
 
 # ---------- Terminology ----------
+
+# ---------- File Browser ----------
+
+@app.get("/api/files")
+async def list_files(project: str = Query(default=None), limit: int = Query(default=100, le=1000),
+                     offset: int = Query(default=0), db: AsyncSession = Depends(get_db)):
+    """List files with optional project filter."""
+    q = (
+        select(File.id, File.path, File.format, File.total_strings, File.translated_strings,
+               File.last_export_at, File.last_import_at, File.created_at,
+               Project.name.label("project_name"), Project.id.label("project_id"))
+        .join(Project, Project.id == File.project_id, isouter=True)
+    )
+    if project:
+        q = q.where(Project.name.ilike(f"%{project}%"))
+    # Only show files that have strings
+    q = q.where(File.total_strings > 0)
+    q = q.order_by(File.total_strings.desc(), File.id.desc()).offset(offset).limit(limit)
+    rows = (await db.execute(q)).all()
+    count_q = select(func.count()).select_from(File).where(File.total_strings > 0)
+    if project:
+        count_q = count_q.join(Project, Project.id == File.project_id).where(Project.name.ilike(f"%{project}%"))
+    total = (await db.execute(count_q)).scalar() or 0
+    return {
+        "files": [{
+            "id": r.id, "path": r.path, "format": r.format,
+            "total_strings": r.total_strings, "translated_strings": r.translated_strings,
+            "last_export_at": r.last_export_at.isoformat() if r.last_export_at else None,
+            "last_import_at": r.last_import_at.isoformat() if r.last_import_at else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "project_name": r.project_name, "project_id": r.project_id,
+        } for r in rows],
+        "total": total, "offset": offset, "limit": limit,
+    }
+
+
+@app.get("/api/files/{file_id}/strings")
+async def file_strings(
+    file_id: int,
+    offset: int = 0,
+    limit: int = Query(default=100, le=1000),
+    quality_max: int = Query(default=None),
+    search: str = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get strings in a file with pagination, quality filter, and search."""
+    file_rec = await db.get(File, file_id, options=[selectinload(File.project)])
+    if not file_rec:
+        raise HTTPException(404, "File not found")
+    
+    base_where = "fs.file_id = :file_id"
+    params = {"file_id": file_id, "offset": offset, "limit": limit}
+    
+    if quality_max is not None:
+        base_where += " AND t.quality_level <= :qmax"
+        params["qmax"] = quality_max
+    if search:
+        base_where += " AND (s.msgid ILIKE :search OR t.msgstr ILIKE :search)"
+        params["search"] = f"%{search}%"
+    
+    count_q = text(f"SELECT COUNT(*) FROM file_strings fs JOIN strings s ON s.id = fs.string_id JOIN translations t ON t.id = fs.translation_id WHERE {base_where}")
+    total = (await db.execute(count_q, params)).scalar() or 0
+    
+    q = text(f"""
+        SELECT fs.id as file_string_id, fs.string_id, fs.translation_id, fs.position,
+               fs.context, fs.location, fs.comment,
+               s.msgid, t.msgstr, t.quality_level, t.source, t.is_approved, t.updated_at, t.reviewed_at
+        FROM file_strings fs
+        JOIN strings s ON s.id = fs.string_id
+        JOIN translations t ON t.id = fs.translation_id
+        WHERE {base_where}
+        ORDER BY fs.position
+        OFFSET :offset LIMIT :limit
+    """)
+    rows = (await db.execute(q, params)).mappings().all()
+    
+    strings = []
+    for r in rows:
+        strings.append({
+            "file_string_id": r["file_string_id"],
+            "string_id": r["string_id"],
+            "translation_id": r["translation_id"],
+            "position": r["position"],
+            "context": r["context"] or "",
+            "location": r["location"] or "",
+            "comment": r["comment"] or "",
+            "msgid": r["msgid"],
+            "msgstr": r["msgstr"] or "",
+            "quality_level": r["quality_level"] or 0,
+            "source": r["source"],
+            "is_approved": r["is_approved"] or False,
+            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            "reviewed_at": r["reviewed_at"].isoformat() if r["reviewed_at"] else None,
+        })
+    
+    return {
+        "file_id": file_id,
+        "path": file_rec.path,
+        "format": file_rec.format,
+        "project_name": file_rec.project.name if file_rec.project else None,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "strings": strings,
+    }
+
+
+from pydantic import BaseModel
+from typing import Optional
+
+class StringEditBody(BaseModel):
+    msgstr: str
+    notes: Optional[str] = None
+    reviewer: str = "anonymous"
+
+
+@app.patch("/api/translations/{translation_id}")
+async def edit_translation(translation_id: int, body: StringEditBody, db: AsyncSession = Depends(get_db)):
+    """Edit a single translation."""
+    trans = await db.get(Translation, translation_id)
+    if not trans:
+        raise HTTPException(404, "Translation not found")
+    
+    old_msgstr = trans.msgstr
+    trans.msgstr = body.msgstr
+    trans.quality_level = max(trans.quality_level, 7)  # human edited
+    trans.updated_at = func.now()
+    
+    review = Review(
+        translation_id=translation_id,
+        reviewer_type="human",
+        reviewer_id=body.reviewer,
+        action="edited",
+        new_msgstr=body.msgstr,
+        notes=body.notes,
+    )
+    db.add(review)
+    await db.commit()
+    
+    return {"ok": True, "translation_id": translation_id, "old": old_msgstr, "new": body.msgstr}
+
+
+# ---------- Changes / Upstream Poll ----------
+
+@app.get("/api/changes")
+async def list_changes(
+    offset: int = 0,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    """Files with recent translation edits, ordered by oldest first."""
+    # Find files that have translations edited after migration
+    q = text("""
+        SELECT f.id as file_id, f.path, p.name as project_name, p.id as project_id,
+               f.total_strings,
+               COUNT(t.id) as changed_count,
+               MIN(t.updated_at) as oldest_change,
+               MAX(t.updated_at) as newest_change,
+               f.last_export_at,
+               f.upstream_url
+        FROM files f
+        JOIN projects p ON p.id = f.project_id
+        JOIN file_strings fs ON fs.file_id = f.id
+        JOIN translations t ON t.id = fs.translation_id
+        WHERE t.updated_at > t.created_at
+        GROUP BY f.id, f.path, p.name, p.id, f.total_strings, f.last_export_at, f.upstream_url
+        ORDER BY MIN(t.updated_at) ASC
+        OFFSET :offset LIMIT :limit
+    """)
+    rows = (await db.execute(q, {"offset": offset, "limit": limit})).mappings().all()
+    
+    count_q = text("""
+        SELECT COUNT(DISTINCT f.id)
+        FROM files f
+        JOIN file_strings fs ON fs.file_id = f.id
+        JOIN translations t ON t.id = fs.translation_id
+        WHERE t.updated_at > t.created_at
+    """)
+    total = (await db.execute(count_q)).scalar() or 0
+    
+    return {
+        "total": total,
+        "changes": [
+            {
+                "file_id": r["file_id"],
+                "path": r["path"].split("/")[-1] if r["path"] else "",
+                "full_path": r["path"],
+                "project_name": r["project_name"],
+                "project_id": r["project_id"],
+                "total_strings": r["total_strings"],
+                "changed_count": r["changed_count"],
+                "oldest_change": r["oldest_change"].isoformat() if r["oldest_change"] else None,
+                "newest_change": r["newest_change"].isoformat() if r["newest_change"] else None,
+                "last_export_at": r["last_export_at"].isoformat() if r["last_export_at"] else None,
+                "upstream_url": r["upstream_url"],
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/changes/{file_id}")
+async def file_changes(
+    file_id: int,
+    offset: int = 0,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get actual changed strings for a file."""
+    q = text("""
+        SELECT s.msgid, t.msgstr, t.quality_level, t.updated_at, t.created_at,
+               t.id as translation_id, fs.position
+        FROM file_strings fs
+        JOIN strings s ON s.id = fs.string_id
+        JOIN translations t ON t.id = fs.translation_id
+        WHERE fs.file_id = :file_id AND t.updated_at > t.created_at
+        ORDER BY t.updated_at DESC
+        OFFSET :offset LIMIT :limit
+    """)
+    rows = (await db.execute(q, {"file_id": file_id, "offset": offset, "limit": limit})).mappings().all()
+    
+    count_q = text("""
+        SELECT COUNT(*) FROM file_strings fs
+        JOIN translations t ON t.id = fs.translation_id
+        WHERE fs.file_id = :file_id AND t.updated_at > t.created_at
+    """)
+    total = (await db.execute(count_q, {"file_id": file_id})).scalar() or 0
+    
+    return {
+        "total": total,
+        "changes": [
+            {
+                "translation_id": r["translation_id"],
+                "position": r["position"],
+                "msgid": r["msgid"],
+                "msgstr": r["msgstr"],
+                "quality_level": r["quality_level"],
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/api/upstream/poll/{file_id}")
+async def poll_upstream(
+    file_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Poll upstream for changes. Downloads upstream file and compares."""
+    import subprocess, tempfile, hashlib
+    
+    f = (await db.execute(select(File).where(File.id == file_id))).scalar()
+    if not f:
+        raise HTTPException(404, "File not found")
+    if not f.upstream_url:
+        raise HTTPException(400, "No upstream URL configured for this file")
+    
+    # Download upstream file
+    try:
+        result = subprocess.run(
+            ["curl", "-sL", "--max-time", "30", f.upstream_url],
+            capture_output=True, timeout=35
+        )
+        if result.returncode != 0:
+            raise HTTPException(502, f"Failed to download upstream: {result.stderr.decode()[:200]}")
+        upstream_content = result.stdout
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Upstream download timed out")
+    
+    # Parse upstream PO file
+    import polib
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.po', delete=False) as tmp:
+            tmp.write(upstream_content)
+            tmp_path = tmp.name
+        po = polib.pofile(tmp_path)
+        os.unlink(tmp_path)
+    except Exception as e:
+        raise HTTPException(400, f"Failed to parse upstream file: {str(e)[:200]}")
+    
+    # Compare with local translations
+    local_strings = (await db.execute(text("""
+        SELECT s.msgid, t.msgstr, t.quality_level, t.id as translation_id
+        FROM file_strings fs
+        JOIN strings s ON s.id = fs.string_id
+        JOIN translations t ON t.id = fs.translation_id
+        WHERE fs.file_id = :file_id
+    """), {"file_id": file_id})).mappings().all()
+    
+    local_map = {r["msgid"]: {"msgstr": r["msgstr"], "quality": r["quality_level"], "tid": r["translation_id"]} for r in local_strings}
+    
+    new_upstream = []  # strings in upstream but not local
+    changed_upstream = []  # strings changed upstream
+    removed_upstream = set(local_map.keys())  # will subtract found ones
+    unchanged = 0
+    
+    for entry in po.translated_entries():
+        msgid = entry.msgid
+        if msgid in removed_upstream:
+            removed_upstream.discard(msgid)
+        
+        local = local_map.get(msgid)
+        if not local:
+            new_upstream.append({"msgid": msgid, "upstream_msgstr": entry.msgstr})
+        elif local["msgstr"] != entry.msgstr:
+            changed_upstream.append({
+                "msgid": msgid,
+                "local_msgstr": local["msgstr"],
+                "upstream_msgstr": entry.msgstr,
+                "translation_id": local["tid"],
+            })
+        else:
+            unchanged += 1
+    
+    # Log sync check
+    project = (await db.execute(select(Project).where(Project.id == f.project_id))).scalar()
+    sync = SyncHistory(
+        project_id=f.project_id, file_id=f.id,
+        direction="poll", platform=f.upstream_url.split("/")[2] if f.upstream_url else "unknown",
+        status="completed",
+        strings_affected=len(new_upstream) + len(changed_upstream),
+        detail=f"new:{len(new_upstream)} changed:{len(changed_upstream)} removed:{len(removed_upstream)} unchanged:{unchanged}"
+    )
+    db.add(sync)
+    await db.commit()
+    
+    return {
+        "file_id": file_id,
+        "upstream_url": f.upstream_url,
+        "summary": {
+            "new": len(new_upstream),
+            "changed": len(changed_upstream),
+            "removed": len(removed_upstream),
+            "unchanged": unchanged,
+            "total_upstream": len(po.translated_entries()),
+        },
+        "new_strings": new_upstream[:50],
+        "changed_strings": changed_upstream[:50],
+        "removed_msgids": list(removed_upstream)[:50],
+    }
+
+
+@app.put("/api/files/{file_id}/upstream")
+async def set_upstream_url(
+    file_id: int,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Set upstream URL for a file."""
+    f = (await db.execute(select(File).where(File.id == file_id))).scalar()
+    if not f:
+        raise HTTPException(404, "File not found")
+    f.upstream_url = body.get("upstream_url", "").strip() or None
+    await db.commit()
+    return {"ok": True, "file_id": file_id, "upstream_url": f.upstream_url}
+
+
+# ---------- Pipeline ----------
+
+from .pipeline import run_pipeline, get_review_strings
+
+@app.post("/api/pipeline/run/{file_id}")
+async def pipeline_run(
+    file_id: int,
+    stages: str = Query(None, description="Comma-separated stages: tm_match,deepl_fill,quality,auto_approve,queue"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Run the translation pipeline on a file."""
+    stage_list = stages.split(",") if stages else None
+    result = await run_pipeline(file_id, db, stages=stage_list)
+    return result
+
+
+@app.post("/api/pipeline/run-batch")
+async def pipeline_run_batch(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Run pipeline on multiple files."""
+    file_ids = body.get("file_ids", [])
+    stages = body.get("stages", None)
+    results = []
+    for fid in file_ids[:20]:  # Max 20 at a time
+        result = await run_pipeline(fid, db, stages=stages)
+        results.append(result)
+    return {"results": results}
+
+
+@app.get("/api/pipeline/status")
+async def pipeline_status(db: AsyncSession = Depends(get_db)):
+    """Overview of pipeline status across all files."""
+    q = text("""
+        SELECT
+            COUNT(*) FILTER (WHERE t.quality_level = 0) as untranslated,
+            COUNT(*) FILTER (WHERE t.quality_level BETWEEN 1 AND 2) as failed,
+            COUNT(*) FILTER (WHERE t.quality_level = 3) as machine_translated,
+            COUNT(*) FILTER (WHERE t.quality_level = 5) as auto_pass,
+            COUNT(*) FILTER (WHERE t.quality_level = 7) as tm_matched,
+            COUNT(*) FILTER (WHERE t.quality_level >= 9) as approved,
+            COUNT(*) as total
+        FROM translations t WHERE t.is_current = true
+    """)
+    r = (await db.execute(q)).mappings().one()
+    return {
+        "untranslated": r["untranslated"],
+        "failed": r["failed"],
+        "machine_translated": r["machine_translated"],
+        "auto_pass": r["auto_pass"],
+        "tm_matched": r["tm_matched"],
+        "approved": r["approved"],
+        "total": r["total"],
+        "needs_review": r["failed"] + r["machine_translated"],
+        "auto_handled": r["auto_pass"] + r["tm_matched"] + r["approved"],
+    }
+
+
+@app.get("/api/review/file/{file_id}")
+async def review_file_strings(
+    file_id: int,
+    offset: int = 0,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get strings needing review for a file, worst first, with TM suggestions."""
+    return await get_review_strings(file_id, db, offset, limit)
+
+
+@app.post("/api/review/decide/{translation_id}")
+async def review_decide(
+    translation_id: int,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Human review decision: approve, reject, or edit."""
+    action = body.get("action")  # approve, reject, edit
+    if action not in ("approve", "reject", "edit"):
+        raise HTTPException(400, "action must be approve, reject, or edit")
+    
+    t = (await db.execute(select(Translation).where(Translation.id == translation_id))).scalar()
+    if not t:
+        raise HTTPException(404, "Translation not found")
+    
+    old_msgstr = t.msgstr
+    
+    if action == "approve":
+        t.quality_level = 9
+        t.is_approved = True
+    elif action == "reject":
+        t.quality_level = 1
+        t.is_approved = False
+    elif action == "edit":
+        new_text = body.get("msgstr", "").strip()
+        if not new_text:
+            raise HTTPException(400, "msgstr required for edit")
+        t.msgstr = new_text
+        t.quality_level = 9
+        t.is_approved = True
+    
+    # Log review
+    review = Review(
+        translation_id=translation_id,
+        reviewer="human",
+        reviewer_type="human",
+        action=action,
+        old_msgstr=old_msgstr,
+        new_msgstr=t.msgstr if action == "edit" else None,
+    )
+    db.add(review)
+    await db.commit()
+    
+    return {"ok": True, "action": action, "translation_id": translation_id}
+
 
 @app.get("/api/terminology")
 async def list_terminology(db: AsyncSession = Depends(get_db)):
