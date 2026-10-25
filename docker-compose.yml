@@ -5,27 +5,27 @@ services:
     image: postgres:17
     environment:
       POSTGRES_USER: trv2app
-      POSTGRES_PASSWORD: changeme
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: trv2
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
 
   backend:
     build: ./backend
     environment:
-      DATABASE_URL: postgresql+asyncpg://trv2app:changeme@db/trv2
-      JWT_SECRET: change-me-to-a-random-secret
+      DATABASE_URL: postgresql+asyncpg://trv2app:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db/trv2
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       - db
 
   frontend:
     build: ./frontend
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:80"
     depends_on:
       - backend
 

@@ -34,9 +34,15 @@ A production-grade translation review system for managing, reviewing, and qualit
 
 ```bash
 cp .env.example .env
-# Edit .env with your settings
+# Generate a URI-safe password, then put it in POSTGRES_PASSWORD in .env:
+openssl rand -hex 32
 docker compose up -d
 ```
+
+The Compose ports bind to loopback, so the UI and API are available only on
+this machine by default. The application does not currently implement API
+authentication or the admin/API-key endpoints; do not expose it through a
+public interface or reverse proxy.
 
 ### Manual Installation
 
@@ -60,7 +66,7 @@ createdb trv2
 export DATABASE_URL="postgresql+asyncpg://user:pass@localhost/trv2"
 
 # Run (tables auto-created on first start)
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 #### Frontend
@@ -106,11 +112,11 @@ npm run build
 ### Search
 - `GET /api/search?q=term&limit=50` — Full-text search
 
-### Admin
-- `POST /api/admin/login` — Authentication
-- `GET /api/admin/api-keys` — List API keys
-- `POST /api/admin/api-keys` — Create API key
-- `DELETE /api/admin/api-keys/{id}` — Delete API key
+### Security
+
+The API currently has no authentication. The Compose setup binds its ports to
+localhost and configures CORS for the local frontend only. Keep these network
+restrictions in place until an authenticated multi-user workflow is available.
 
 ## Quality Levels
 
@@ -133,8 +139,7 @@ npm run build
 |----------|-------------|---------|
 | `DATABASE_URL` | PostgreSQL connection string | Required |
 | `REVIEW_PO_PATH` | Path to review-po-v3.py | `~/tools/review-po-v3/review-po-v3.py` |
-| `JWT_SECRET` | Secret for JWT tokens | Required |
-| `ADMIN_PASSWORD` | Initial admin password | Auto-generated |
+| `CORS_ORIGINS` | Comma-separated browser origins allowed by CORS | Local frontend origins |
 
 ## License
 
